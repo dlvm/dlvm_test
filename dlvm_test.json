@@ -1,0 +1,251 @@
+{
+    "AWSTemplateFormatVersion": "2010-09-09",
+    "Description": "Test",
+
+    "Parameters": {
+		"KeyName": {
+			"Description": "The EC2 Key Pair to allow SSH access to the instances",
+			"Type": "AWS::EC2::KeyPair::KeyName",
+			"ConstraintDescription": "must be the name of an existing EC2 KeyPair."
+		},
+        "AmiId": {
+            "Description": "ENA enabled ubuntu AMI",
+            "Type": "AWS::EC2::Image::Id"
+        },
+        "AZ": {
+            "Description": "Avalability Zone",
+            "Type": "AWS::EC2::AvailabilityZone::Name",
+            "Default": "us-west-2a"
+        },
+		"DpvNumber": {
+			"Type": "Number",
+			"Default": "2"
+		},
+		"DpvInstanceType": {
+			"Type": "String",
+			"Default": "i3.16xlarge"
+		},
+		"ManagerInstanceType": {
+			"Type": "String",
+			"Default": "i3.16xlarge"
+		}
+    },
+
+	"Resources": {
+		"DlvmVpc": {
+            "Type": "AWS::EC2::VPC",
+            "Properties": {
+                "CidrBlock": "10.0.0.0/16",
+                "InstanceTenancy": "default"
+            }
+        },
+
+		"DlvmSubnet": {
+            "Type": "AWS::EC2::Subnet",
+            "Properties": {
+                "CidrBlock": "10.0.0.0/24",
+                "AvailabilityZone": {"Ref": "AZ"},
+                "VpcId": {
+                    "Ref": "DlvmVpc"
+                }
+            }
+        },
+
+		"DlvmDhcpOption": {
+            "Type": "AWS::EC2::DHCPOptions",
+            "Properties": {
+                "DomainNameServers": [ "AmazonProvidedDNS" ]
+            }
+        },
+
+		"DlvmDhcpAssociation": {
+            "Type": "AWS::EC2::VPCDHCPOptionsAssociation",
+            "Properties": {
+                "VpcId": { "Ref": "DlvmVpc" },
+                "DhcpOptionsId": { "Ref": "DlvmDhcpOption" }
+            }
+        },
+
+		"DlvmIgw": {
+            "Type": "AWS::EC2::InternetGateway"
+        },
+
+		"DlvmGatewayAttachment": {
+            "Type": "AWS::EC2::VPCGatewayAttachment",
+            "Properties": {
+                "VpcId": { "Ref": "DlvmVpc" },
+                "InternetGatewayId": { "Ref": "DlvmIgw" }
+            }
+        },
+
+		"DlvmRouteTable": {
+            "Type": "AWS::EC2::RouteTable",
+            "Properties": {
+                "VpcId": { "Ref": "DlvmVpc" }
+            }
+        },
+
+		"DlvmRouteAssociation": {
+            "Type": "AWS::EC2::SubnetRouteTableAssociation",
+            "Properties": {
+                "RouteTableId": { "Ref": "DlvmRouteTable" },
+                "SubnetId": { "Ref": "DlvmSubnet" }
+            }
+        },
+
+		"DlvmRoute": {
+            "Type": "AWS::EC2::Route",
+            "Properties": {
+                "DestinationCidrBlock": "0.0.0.0/0",
+                "RouteTableId": {
+                    "Ref": "DlvmRouteTable"
+                },
+                "GatewayId": { "Ref": "DlvmIgw" }
+            },
+            "DependsOn": "DlvmGatewayAttachment"
+        },
+
+        "DlvmPG": {
+            "Type": "AWS::EC2::PlacementGroup"
+        },
+
+		"DlvmSG": {
+			"Type": "AWS::EC2::SecurityGroup",
+            "Properties": {
+                "GroupDescription": "SG for all instances",
+                "VpcId": {"Ref": "DlvmVpc" },
+                "SecurityGroupIngress": [{
+                        "IpProtocol": "tcp",
+                        "FromPort": "22",
+                        "ToPort": "22",
+                        "CidrIp": "0.0.0.0/0"
+                },{
+					"IpProtocol": "-1",
+                    "CidrIp": "10.0.0.0/16"
+				}],
+                "SecurityGroupEgress": [{
+                        "IpProtocol": "-1",
+                        "CidrIp": "0.0.0.0/0"
+                }]
+            }
+		},
+
+		"DpvLaunchConfiguration": {
+            "Type": "AWS::AutoScaling::LaunchConfiguration",
+            "Properties": {
+                "KeyName": {"Ref": "KeyName"},
+                "ImageId": {"Ref": "AmiId"},
+                "SecurityGroups": [{"Ref": "DlvmSG"}],
+                "InstanceType": {"Ref": "DpvInstanceType"},
+                "BlockDeviceMappings": [{
+                    "DeviceName": "/dev/nvme*n1",
+                    "VirtualName": "ephemeral0"
+                }],
+                "UserData": { "Fn::Base64": {"Fn::Join": ["", [
+                    "#!/bin/bash\n",
+                    "apt install lvm2 -y\n",
+                    "pvcreate /dev/nvme0n1\n",
+                    "vgcreate dlvm_vg /dev/nvme0n1\n"
+                ]]}}
+            }
+        },
+
+		"DpvAutoScalingGroup": {
+            "Type": "AWS::AutoScaling::AutoScalingGroup",
+            "Properties": {
+                "AvailabilityZones": [{"Ref": "AZ"}],
+                "LaunchConfigurationName": {"Ref": "DpvLaunchConfiguration"},
+				"DesiredCapacity": {"Ref": "DpvNumber"},
+                "MinSize": {"Ref": "DpvNumber"},
+                "MaxSize": {"Ref": "DpvNumber"},
+                "VPCZoneIdentifier": [{"Ref": "DlvmSubnet"}]
+            }
+        },
+
+		"DlvmManagerRole": {
+			"Type": "AWS::IAM::Role",
+			"Properties": {
+				"AssumeRolePolicyDocument": {
+					"Statement": [{
+						"Effect": "Allow",
+						"Principal": {
+							"Service": ["ec2.amazonaws.com"]
+						},
+						"Action": ["sts:AssumeRole"]
+					}]
+				},
+				"Path": "/",
+				"Policies": [{
+					"PolicyName": "DescribeAutoScalingGroup",
+					"PolicyDocument": {
+						"Statement": [{
+							"Effect": "Allow",
+							"Action": [
+                                "autoscaling:*",
+                                "ec2:*"
+                            ],
+							"Resource": "*"
+						}]
+					}
+				}]
+			}
+		},
+
+		"DlvmManagerProfile": {
+			"Type": "AWS::IAM::InstanceProfile",
+			"Properties": {
+				"Path": "/",
+				"Roles": [{
+					"Ref": "DlvmManagerRole"
+				}]
+			}
+		},
+
+		"DlvmManager": {
+			"Type": "AWS::EC2::Instance",
+			"Properties": {
+				"KeyName": {"Ref": "KeyName"},
+				"InstanceType": {"Ref": "ManagerInstanceType"},
+				"ImageId": {"Ref": "AmiId"},
+				"IamInstanceProfile": {"Ref": "DlvmManagerProfile"},
+                "PlacementGroupName": {"Ref": "DlvmPG"},
+                "NetworkInterfaces": [{
+                    "AssociatePublicIpAddress": "true",
+                    "DeviceIndex": "0",
+                    "GroupSet": [{"Ref": "DlvmSG"}],
+                    "SubnetId": {"Ref": "DlvmSubnet"}
+                }],
+				"UserData": { "Fn::Base64": {"Fn::Join": ["", [
+					"#!/bin/bash\n",
+                    "apt install python-pip -y\n",
+                    "apt install libssl-dev -y\n",
+                    "pip install pip --upgrade\n",
+                    "pip install awscli\n",
+                    "pip install ansible\n",
+                    "aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names ",
+                    {"Ref": "DpvAutoScalingGroup"},
+                    " --region ",
+                    {"Ref": "AWS::Region"},
+                    " --query AutoScalingGroups[].Instances[].InstanceId --output text > /tmp/dpv_id_list\n",
+                    "for i in $(cat /tmp/dpv_id_list);\n",
+                    "do\n",
+                    "aws ec2 describe-instances --instance-id $i ",
+                    "--query Reservations[].Instances[].PrivateIpAddress ",
+                    "--region ",
+                    {"Ref": "AWS::Region"},
+                    " --output text >> /tmp/dpv_list\n",
+                    "done\n"
+				]]}}
+			}
+		}
+	},
+
+	"Outputs": {
+		"ManagerAddress": {
+			"Description": "login to this address",
+			"Value": {
+				"Fn::GetAtt": ["DlvmManager", "PublicIp"]
+			}
+		}
+	}
+}
